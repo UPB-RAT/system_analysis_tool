@@ -1,8 +1,5 @@
 import streamlit as st
 import sympy as sp
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
 
 from ode import (
     linearize_odes, 

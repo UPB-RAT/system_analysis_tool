@@ -3,7 +3,6 @@ import numpy as np
 import sympy as sp
 from pprint import pprint
 from typing import Optional, List
-import matplotlib.pyplot as plt
 
 # import plotly.graph_objects as go
 import plotly.figure_factory as ff

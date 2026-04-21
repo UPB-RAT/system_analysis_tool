@@ -25,7 +25,7 @@ max_points = 5000
 
 st.set_page_config(page_title="ODE Solver", layout="wide")
 st.title("ODE Solver")
-
+T = st.sidebar.slider("Time Horizon", min_time, max_time, int(max_time * 0.4))
 
 ######################################
 

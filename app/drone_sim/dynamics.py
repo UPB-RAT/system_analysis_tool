@@ -1,149 +1,112 @@
 import numpy as np
-from numpy import sin, cos, tan, pi, sign
-from scipy.integrate import ode
-from .math_utils import quat2Dcm, quatToYPR_ZYX
+from .math_utils import get_rotation_matrix, get_angular_jacobian
 
 class Quadcopter:
-    def __init__(self, params, Ti=0, orient="NED"):
+    """
+    Quadcopter dynamics using Newton-Euler equations and explicit integration.
+    State vector (12): [x, y, z, phi, theta, psi, vx, vy, vz, p, q, r]
+    """
+    def __init__(self, params, orient="NED"):
         self.params = params
         self.orient = orient
+        self.m = params["mB"]
+        self.g = params["g"]
+        self.I = params["IB"]
+        self.I_inv = np.linalg.inv(self.I)
+        self.k = params["kTh"]
+        self.b = params["kTo"]
+        self.L_x = params["dxm"]
+        self.L_y = params["dym"]
         
-        # Initial State
-        self.state = self.init_state()
-        self.pos   = self.state[0:3]
-        self.quat  = self.state[3:7]
-        self.vel   = self.state[7:10]
-        self.omega = self.state[10:13]
-        self.wMotor = np.array([self.state[13], self.state[15], self.state[17], self.state[19]])
-        self.vel_dot = np.zeros(3)
-        self.omega_dot = np.zeros(3)
-        self.acc = np.zeros(3)
-
-        self.extended_state()
-        self.forces()
-
-        # Set Integrator
-        self.integrator = ode(self.state_dot).set_integrator('dopri5', first_step='0.00005', atol='10e-6', rtol='10e-6')
-        self.integrator.set_initial_value(self.state, Ti)
-
-    def init_state(self):
-        s = np.zeros(21)
-        # Default hovering state
-        s[3] = 1.0 # q0
-        w_hover = self.params["w_hover"]
-        s[13] = s[15] = s[17] = s[19] = w_hover
-        return s
-
-    def extended_state(self):
-        self.dcm = quat2Dcm(self.quat)
-        YPR = quatToYPR_ZYX(self.quat)
-        self.euler = YPR[::-1] 
-        self.psi, self.theta, self.phi = YPR
-
-    def forces(self):
-        self.thr = self.params["kTh"] * self.wMotor**2
-        self.tor = self.params["kTo"] * self.wMotor**2
-
-    def state_dot(self, t, state):
-        cmd = self.current_cmd if hasattr(self, 'current_cmd') and self.current_cmd is not None else np.ones(4) * self.params["w_hover"]
-        wind = self.current_wind if hasattr(self, 'current_wind') and self.current_wind is not None else Wind('None')
-        mB = self.params["mB"]
-        g = self.params["g"]
-        dxm = self.params["dxm"]
-        dym = self.params["dym"]
-        IB = self.params["IB"]
-        IBxx, IByy, IBzz = IB[0,0], IB[1,1], IB[2,2]
-        Cd = self.params["Cd"]
-        kTh, kTo = self.params["kTh"], self.params["kTo"]
-        tau, damp, kp = self.params["tau"], self.params["damp"], self.params["kp"]
-        minWmotor, maxWmotor = self.params["minWmotor"], self.params["maxWmotor"]
-        IRzz = self.params.get("IRzz", 2.7e-5)
-        uP = 1 if self.params.get("usePrecession", False) else 0
-
-        # State Vector
-        x, y, z = state[0:3]
-        q0, q1, q2, q3 = state[3:7]
-        xdot, ydot, zdot = state[7:10]
-        p, q, r = state[10:13]
-        wM1, wdotM1 = state[13:15]
-        wM2, wdotM2 = state[15:17]
-        wM3, wdotM3 = state[17:19]
-        wM4, wdotM4 = state[19:21]
-
-        # Motor Dynamics
-        uMotor = cmd
-        wddotM1 = (-2.0*damp*tau*wdotM1 - wM1 + kp*uMotor[0])/(tau**2)
-        wddotM2 = (-2.0*damp*tau*wdotM2 - wM2 + kp*uMotor[1])/(tau**2)
-        wddotM3 = (-2.0*damp*tau*wdotM3 - wM3 + kp*uMotor[2])/(tau**2)
-        wddotM4 = (-2.0*damp*tau*wdotM4 - wM4 + kp*uMotor[3])/(tau**2)
-
-        wMotor = np.clip(np.array([wM1, wM2, wM3, wM4]), minWmotor, maxWmotor)
-        thrust = kTh * wMotor**2
-        torque = kTo * wMotor**2
-        ThrM1, ThrM2, ThrM3, ThrM4 = thrust
-        TorM1, TorM2, TorM3, TorM4 = torque
-
-        # Wind (simplified or passed)
-        velW, qW1, qW2 = wind.randomWind(t)
-
-        if self.orient == "NED":
-            DynamicsDot = np.array([
-                [xdot],
-                [ydot],
-                [zdot],
-                [-0.5*p*q1 - 0.5*q*q2 - 0.5*q3*r],
-                [0.5*p*q0 - 0.5*q*q3 + 0.5*q2*r],
-                [0.5*p*q3 + 0.5*q*q0 - 0.5*q1*r],
-                [-0.5*p*q2 + 0.5*q*q1 + 0.5*q0*r],
-                [(Cd*sign(velW*cos(qW1)*cos(qW2) - xdot)*(velW*cos(qW1)*cos(qW2) - xdot)**2 - 2*(q0*q2 + q1*q3)*(sum(thrust)))/mB],
-                [(Cd*sign(velW*sin(qW1)*cos(qW2) - ydot)*(velW*sin(qW1)*cos(qW2) - ydot)**2 + 2*(q0*q1 - q2*q3)*(sum(thrust)))/mB],
-                [(-Cd*sign(velW*sin(qW2) + zdot)*(velW*sin(qW2) + zdot)**2 - (sum(thrust))*(q0**2 - q1**2 - q2**2 + q3**2) + g*mB)/mB],
-                [((IByy - IBzz)*q*r - uP*IRzz*(wM1 - wM2 + wM3 - wM4)*q + (ThrM1 - ThrM2 - ThrM3 + ThrM4)*dym)/IBxx],
-                [((IBzz - IBxx)*p*r + uP*IRzz*(wM1 - wM2 + wM3 - wM4)*p + (ThrM1 + ThrM2 - ThrM3 - ThrM4)*dxm)/IByy],
-                [((IBxx - IByy)*p*q - TorM1 + TorM2 - TorM3 + TorM4)/IBzz]
-            ])
-        else: # ENU
-            # Simplified ENU from quad.py
-            DynamicsDot = np.array([
-                [xdot],
-                [ydot],
-                [zdot],
-                [-0.5*p*q1 - 0.5*q*q2 - 0.5*q3*r],
-                [0.5*p*q0 - 0.5*q*q3 + 0.5*q2*r],
-                [0.5*p*q3 + 0.5*q*q0 - 0.5*q1*r],
-                [-0.5*p*q2 + 0.5*q*q1 + 0.5*q0*r],
-                [(Cd*sign(velW*cos(qW1)*cos(qW2) - xdot)*(velW*cos(qW1)*cos(qW2) - xdot)**2 + 2*(q0*q2 + q1*q3)*(sum(thrust)))/mB],
-                [(Cd*sign(velW*sin(qW1)*cos(qW2) - ydot)*(velW*sin(qW1)*cos(qW2) - ydot)**2 - 2*(q0*q1 - q2*q3)*(sum(thrust)))/mB],
-                [(-Cd*sign(velW*sin(qW2) + zdot)*(velW*sin(qW2) + zdot)**2 + (sum(thrust))*(q0**2 - q1**2 - q2**2 + q3**2) - g*mB)/mB],
-                [((IByy - IBzz)*q*r + uP*IRzz*(wM1 - wM2 + wM3 - wM4)*q + (ThrM1 - ThrM2 - ThrM3 + ThrM4)*dym)/IBxx],
-                [((IBzz - IBxx)*p*r - uP*IRzz*(wM1 - wM2 + wM3 - wM4)*p + (-ThrM1 - ThrM2 + ThrM3 + ThrM4)*dxm)/IByy],
-                [((IBxx - IBzz)*p*q + TorM1 - TorM2 + TorM3 - TorM4)/IBzz]
-            ])
-
-        sdot = np.zeros(21)
-        sdot[0:13] = DynamicsDot.flatten()
-        sdot[13] = wdotM1
-        sdot[14] = wddotM1
-        sdot[15] = wdotM2
-        sdot[16] = wddotM2
-        sdot[17] = wdotM3
-        sdot[18] = wddotM3
-        sdot[19] = wdotM4
-        sdot[20] = wddotM4
-        return sdot
-
-    def update(self, t, Ts, cmd, wind):
-        prev_vel = self.vel
-        prev_omega = self.omega
-        self.current_cmd = cmd
-        self.current_wind = wind
-        self.state = self.integrator.integrate(t, t+Ts)
+        # Initial State: [pos(3), euler(3), vel(3), pqr(3)]
+        self.state = np.zeros(12)
+        # Standard hover setup
+        self.psi, self.theta, self.phi = 0.0, 0.0, 0.0
         self.pos = self.state[0:3]
-        self.quat = self.state[3:7]
-        self.vel = self.state[7:10]
-        self.omega = self.state[10:13]
-        self.wMotor = np.array([self.state[13], self.state[15], self.state[17], self.state[19]])
-        self.vel_dot = (self.vel - prev_vel)/Ts
-        self.omega_dot = (self.omega - prev_omega)/Ts
-        self.extended_state()
-        self.forces()
+        self.euler = self.state[3:6]
+        self.vel = self.state[6:9]
+        self.omega = self.state[9:12]
+        self.vel_dot = np.zeros(3)
+
+    def get_forces_and_moments(self, rotor_speeds):
+        """
+        Calculates Total Thrust (T) and Control Moments (tau) from rotor speeds.
+        """
+        w_sq = np.square(rotor_speeds)
+        
+        # Total Thrust (directed along body-z)
+        T = self.k * np.sum(w_sq)
+        
+        # Control Moments
+        # Assumed layout: 1: Front-Right (+x, +y), 2: Front-Left (+x, -y), 3: Back-Left (-x, -y), 4: Back-Right (-x, +y)
+        # Note: Adjusting based on common quad-x layout or user's provided logic
+        # tau_x (Roll): Difference between left and right rotors
+        # tau_y (Pitch): Difference between front and back rotors
+        # Following provided math: tx = lk(w4^2 - w2^2), ty = lk(w3^2 - w1^2)
+        tau_x = self.L_y * self.k * (w_sq[3] - w_sq[1]) 
+        tau_y = self.L_x * self.k * (w_sq[2] - w_sq[0])
+        # Yaw: Reactive torques
+        tau_z = self.b * (w_sq[0] - w_sq[1] + w_sq[2] - w_sq[3])
+        
+        return T, np.array([tau_x, tau_y, tau_z])
+
+    def calculate_accelerations(self, state, rotor_speeds):
+        phi, theta, psi = state[3:6]
+        v_world = state[6:9]
+        p, q, r = state[9:12]
+        
+        T, tau = self.get_forces_and_moments(rotor_speeds)
+        R = get_rotation_matrix(phi, theta, psi)
+        
+        # 1. Linear Acceleration
+        # Thrust is in body frame [0, 0, T]
+        thrust_body = np.array([0, 0, T])
+        if self.orient == "NED":
+            # In NED, force is Up (negative z), Gravity is [0, 0, g]
+            thrust_body = np.array([0, 0, -T])
+            gravity = np.array([0, 0, self.g])
+        else: # ENU
+            # In ENU, force is Up (positive z), Gravity is [0, 0, -g]
+            thrust_body = np.array([0, 0, T])
+            gravity = np.array([0, 0, -self.g])
+            
+        accel_linear = (R @ thrust_body) / self.m + gravity
+        
+        # Add drag if Cd exists
+        if self.params.get("Cd", 0) > 0:
+            accel_linear -= (self.params["Cd"] / self.m) * v_world
+            
+        # 2. Angular Acceleration
+        # dot(p,q,r) = I_inv * (tau - omega x (I * omega))
+        pqr = state[9:12]
+        accel_angular = self.I_inv @ (tau - np.cross(pqr, self.I @ pqr))
+        
+        return accel_linear, accel_angular
+
+    def update(self, t, dt, rotor_speeds, wind=None):
+        """
+        Explicit integration step (0.01s typically)
+        """
+        accel_linear, accel_angular = self.calculate_accelerations(self.state, rotor_speeds)
+        
+        # 1. Update Velocities
+        self.state[6:9] += accel_linear * dt
+        self.state[9:12] += accel_angular * dt
+        self.vel_dot = accel_linear # Store for controller access
+        
+        # 2. Update Position
+        self.state[0:3] += self.state[6:9] * dt
+        
+        # 3. Update Orientation (using Jacobian)
+        phi, theta = self.state[3], self.state[4]
+        if abs(np.cos(theta)) < 1e-3: theta += 1e-3 # Avoid singularity
+        J_inv = get_angular_jacobian(phi, theta)
+        euler_rates = J_inv @ self.state[9:12]
+        self.state[3:6] += euler_rates * dt
+        
+        # Synch local properties
+        self.pos = self.state[0:3]
+        self.euler = self.state[3:6]
+        self.vel = self.state[6:9]
+        self.omega = self.state[9:12]
+        self.psi = self.euler[2] # For controller/trajectory compatibility

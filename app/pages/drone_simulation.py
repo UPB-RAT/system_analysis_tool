@@ -25,7 +25,10 @@ st.sidebar.header("Simulation Settings")
 Tf = st.sidebar.slider("Simulation Duration (s)", 5, 30, 15, 1)
 Ts = 0.01 # 10ms timestep for the main loop
 
-st.sidebar.header("Trajectory")
+st.sidebar.header("Trajectory Settings")
+orient_mode = st.sidebar.selectbox("Coordinate System", ["NED (North-East-Down)", "ENU (East-North-Up)"], index=0)
+orient = "NED" if "NED" in orient_mode else "ENU"
+
 traj_type_options = {
     "Static Hover": [0, 0, 1],
     "Simple Interpolation": [2, 2, 1],
@@ -34,8 +37,19 @@ traj_type_options = {
     "Minimum Jerk": [5, 3, 1],
     "Minimum Snap": [6, 3, 1]
 }
-traj_name = st.sidebar.selectbox("Trajectory Type", list(traj_type_options.keys()), index=4)
+traj_name = st.sidebar.selectbox("Trajectory Algorithm", list(traj_type_options.keys()), index=4)
 traj_select = traj_type_options[traj_name]
+
+# Waypoint Editor
+st.sidebar.subheader("Waypoints (m)")
+default_wps = pd.DataFrame([
+    {"X": 0.0, "Y": 0.0, "Z": 0.0},
+    {"X": 2.0, "Y": 2.0, "Z": 1.0},
+    {"X": -2.0, "Y": 3.0, "Z": -3.0},
+    {"X": 0.0, "Y": 0.0, "Z": 0.0}
+])
+edited_wps = st.sidebar.data_editor(default_wps, num_rows="dynamic")
+wps_array = edited_wps.to_numpy()
 
 # --- Initialize Parameters ---
 params = {
@@ -61,16 +75,28 @@ params = {
 
 # Calculate Hover Speed
 params["w_hover"] = np.sqrt((mB * g / 4.0) / params["kTh"])
-params["mixerFM"] = makeMixerFM(params, orient="NED")
+params["mixerFM"] = makeMixerFM(params, orient=orient)
 params["mixerFMinv"] = np.linalg.inv(params["mixerFM"])
 
 # --- Run Simulation ---
 if st.button("🚀 Run Simulation"):
     with st.spinner("Simulating..."):
         # Initialize
-        quad = Quadcopter(params, Ti=0, orient="NED")
-        traj = Trajectory(quad, "xyz_pos", traj_select)
-        ctrl = Control(quad, params, traj.yawType, orient="NED")
+        quad = Quadcopter(params, orient=orient)
+        
+        # Set initial position to match the first waypoint
+        quad.state[0:3] = wps_array[0]
+        quad.pos = quad.state[0:3].copy()
+        
+        # Prepare Waypoints Data for Trajectory class
+        # (t_wps, wps, y_wps, v_wp)
+        t_wps_custom = np.linspace(0, Tf, len(wps_array))
+        y_wps_custom = np.zeros(len(wps_array))
+        v_avg = 1.0
+        wp_data = (t_wps_custom, wps_array, y_wps_custom, v_avg)
+        
+        traj = Trajectory(quad, "xyz_pos", traj_select, waypoints_data=wp_data)
+        ctrl = Control(quad, params, traj.yawType, orient=orient)
         wind = Wind('None')
 
         numSteps = int(Tf / Ts)
@@ -111,22 +137,25 @@ if st.button("🚀 Run Simulation"):
             
             fig3d = go.Figure(
                 data=[
-                    go.Scatter3d(x=target_pos_all[:,0], y=target_pos_all[:,1], z=-target_pos_all[:,2],
+                    go.Scatter3d(x=target_pos_all[:,0], y=target_pos_all[:,1], z=target_pos_all[:,2],
                                mode='lines', line=dict(color='red', width=2, dash='dot'), name='Planned Trajectory'),
-                    go.Scatter3d(x=traj.wps[:,0], y=traj.wps[:,1], z=-traj.wps[:,2],
+                    go.Scatter3d(x=traj.wps[:,0], y=traj.wps[:,1], z=traj.wps[:,2],
                                mode='markers', marker=dict(size=4, color='darkred'), name='Waypoints'),
-                    go.Scatter3d(x=[pos_all[0,0]], y=[pos_all[0,1]], z=[-pos_all[0,2]],
+                    go.Scatter3d(x=[pos_all[0,0]], y=[pos_all[0,1]], z=[pos_all[0,2]],
                                mode='lines', line=dict(color='blue', width=4), name='Actual Path'),
-                    go.Scatter3d(x=[pos_all[0,0]], y=[pos_all[0,1]], z=[-pos_all[0,2]],
+                    go.Scatter3d(x=[pos_all[0,0]], y=[pos_all[0,1]], z=[pos_all[0,2]],
                                mode='markers', marker=dict(size=10, color='darkblue', symbol='diamond'), name='Drone')
                 ],
                 layout=go.Layout(
-                    scene=dict(xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Alt (m)', aspectmode='cube'),
+                    scene=dict(
+                        xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)', 
+                        aspectmode='cube'
+                    ),
                     height=700, margin=dict(l=0, r=0, b=0, t=30),
                     updatemenus=[dict(
                         type="buttons",
-                        font=dict(color="#2c3e50"), # Dark color for visibility
-                        bgcolor="rgba(255, 255, 255, 0.8)", # Light background for contrast
+                        font=dict(color="#2c3e50"),
+                        bgcolor="rgba(255, 255, 255, 0.8)",
                         buttons=[
                             dict(label="▶️ Play Flight", method="animate", args=[None, {"frame": {"duration": 40, "redraw": True}, "fromcurrent": True}]),
                             dict(label="⏸️ Pause", method="animate", args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate", "transition": {"duration": 0}}])
@@ -134,10 +163,15 @@ if st.button("🚀 Run Simulation"):
                     )]
                 ),
                 frames=[go.Frame(data=[
-                    go.Scatter3d(x=pos_all[:k+1,0], y=pos_all[:k+1,1], z=-pos_all[:k+1,2]),
-                    go.Scatter3d(x=[pos_all[k,0]], y=[pos_all[k,1]], z=[-pos_all[k,2]])
+                    go.Scatter3d(x=pos_all[:k+1,0], y=pos_all[:k+1,1], z=pos_all[:k+1,2]),
+                    go.Scatter3d(x=[pos_all[k,0]], y=[pos_all[k,1]], z=[pos_all[k,2]])
                 ], traces=[2, 3], name=f'f{k}') for k in indices]
             )
+            
+            # Correct Z axis interpretation for display
+            if orient == "NED":
+                fig3d.update_scenes(zaxis_autorange="reversed")
+            
             st.plotly_chart(fig3d, use_container_width=True)
 
         with col_data:
@@ -164,8 +198,8 @@ if st.button("🚀 Run Simulation"):
         fig_pos.add_trace(go.Scatter(x=t_all, y=target_pos_all[:, 0], name='Ref', line=dict(dash='dash')), row=1, col=1)
         fig_pos.add_trace(go.Scatter(x=t_all, y=pos_all[:, 1], name='Actual'), row=1, col=2)
         fig_pos.add_trace(go.Scatter(x=t_all, y=target_pos_all[:, 1], name='Ref', line=dict(dash='dash')), row=1, col=2)
-        fig_pos.add_trace(go.Scatter(x=t_all, y=-pos_all[:, 2], name='Actual'), row=1, col=3)
-        fig_pos.add_trace(go.Scatter(x=t_all, y=-target_pos_all[:, 2], name='Ref', line=dict(dash='dash')), row=1, col=3)
+        fig_pos.add_trace(go.Scatter(x=t_all, y=pos_all[:, 2], name='Actual'), row=1, col=3)
+        fig_pos.add_trace(go.Scatter(x=t_all, y=target_pos_all[:, 2], name='Ref', line=dict(dash='dash')), row=1, col=3)
         fig_pos.update_layout(height=350, showlegend=True)
         st.plotly_chart(fig_pos, use_container_width=True)
 

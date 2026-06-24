@@ -1,89 +1,49 @@
 import numpy as np
-from numpy import sin, cos, tan, sqrt, pi
 
-def quat2Dcm(q):
+def get_rotation_matrix(phi, theta, psi):
     """
-    Quaternion to Direction Cosine Matrix
+    Calculates the ZYX rotation matrix (Body to World) as requested.
+    phi: roll, theta: pitch, psi: yaw (in radians)
     """
-    q0, q1, q2, q3 = q
-    return np.array([
-        [1 - 2*q2**2 - 2*q3**2, 2*(q1*q2 - q0*q3), 2*(q1*q3 + q0*q2)],
-        [2*(q1*q2 + q0*q3), 1 - 2*q1**2 - 2*q3**2, 2*(q2*q3 - q0*q1)],
-        [2*(q1*q3 - q0*q2), 2*(q2*q3 + q0*q1), 1 - 2*q1**2 - 2*q2**2]
+    c_phi = np.cos(phi)
+    s_phi = np.sin(phi)
+    c_theta = np.cos(theta)
+    s_theta = np.sin(theta)
+    c_psi = np.cos(psi)
+    s_psi = np.sin(psi)
+
+    R = np.array([
+        [c_psi * c_theta, c_psi * s_theta * s_phi - s_psi * c_phi, c_psi * s_theta * c_phi + s_psi * s_phi],
+        [s_psi * c_theta, s_psi * s_theta * s_phi + c_psi * c_phi, s_psi * s_theta * c_phi - c_psi * s_phi],
+        [-s_theta,       c_theta * s_phi,                c_theta * c_phi]
     ])
+    return R
 
-def quatToYPR_ZYX(q):
+def get_angular_jacobian(phi, theta):
     """
-    Quaternion to Yaw, Pitch, Roll (ZYX convention)
+    Transforms body angular rates (p, q, r) to Euler angle rates (phi_dot, theta_dot, psi_dot).
+    As specified: dot(Euler) = J_inv * [p, q, r]
     """
-    q0, q1, q2, q3 = q
-    yaw = np.arctan2(2*(q1*q2 + q0*q3), q0**2 + q1**2 - q2**2 - q3**2)
-    pitch = np.arcsin(-2*(q1*q3 - q0*q2))
-    roll = np.arctan2(2*(q2*q3 + q0*q1), q0**2 - q1**2 - q2**2 + q3**2)
-    return np.array([yaw, pitch, roll])
+    c_phi = np.cos(phi)
+    s_phi = np.sin(phi)
+    c_theta = np.cos(theta)
+    t_theta = np.tan(theta)
 
-def RotToQuat(R):
-    """
-    Rotation Matrix to Quaternion
-    """
-    tr = np.trace(R)
-    if tr > 0:
-        S = sqrt(tr + 1.0) * 2
-        qw = 0.25 * S
-        qx = (R[2,1] - R[1,2]) / S
-        qy = (R[0,2] - R[2,0]) / S
-        qz = (R[1,0] - R[0,1]) / S
-    elif (R[0,0] > R[1,1]) and (R[0,0] > R[2,2]):
-        S = sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2
-        qw = (R[2,1] - R[1,2]) / S
-        qx = 0.25 * S
-        qy = (R[0,1] + R[1,0]) / S
-        qz = (R[0,2] + R[2,0]) / S
-    elif R[1,1] > R[2,2]:
-        S = sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2
-        qw = (R[0,2] - R[2,0]) / S
-        qx = (R[0,1] + R[1,0]) / S
-        qy = 0.25 * S
-        qz = (R[1,2] + R[2,1]) / S
-    else:
-        S = sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2
-        qw = (R[1,0] - R[0,1]) / S
-        qx = (R[0,2] + R[2,0]) / S
-        qy = (R[1,2] + R[2,1]) / S
-        qz = 0.25 * S
-    return np.array([qw, qx, qy, qz])
-
-def quatMultiply(q, r):
-    """
-    Quaternion Multiplication
-    """
-    q0, q1, q2, q3 = q
-    r0, r1, r2, r3 = r
-    return np.array([
-        r0*q0 - r1*q1 - r2*q2 - r3*q3,
-        r0*q1 + r1*q0 - r2*q3 + r3*q2,
-        r0*q2 + r1*q3 + r2*q0 - r3*q1,
-        r0*q3 - r1*q2 + r2*q1 + r3*q0
+    # Note: Singularity at theta = +/- 90 degrees handled by small epsilon if needed in dynamics
+    J_inv = np.array([
+        [1, s_phi * t_theta, c_phi * t_theta],
+        [0, c_phi,          -s_phi],
+        [0, s_phi / c_theta, c_phi / c_theta]
     ])
+    return J_inv
 
-def inverse(q):
-    """
-    Quaternion Inverse
-    """
-    return np.array([q[0], -q[1], -q[2], -q[3]]) / np.dot(q, q)
-
-def vectNormalize(v):
-    """
-    Vector Normalization
-    """
+def vect_normalize(v):
     norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
+    return v / norm if norm > 1e-6 else v
 
 def mixerFM(quad, thrust, rateCtrl):
     """
-    Mixer: Force/Moment to Motor Speeds squared
+    Mixed Force/Moment to Motor Speeds squared
     """
     fm = np.array([thrust, rateCtrl[0], rateCtrl[1], rateCtrl[2]])
     w2 = np.dot(quad.params["mixerFMinv"], fm)
@@ -96,14 +56,16 @@ def makeMixerFM(params, orient="NED"):
     kTh = params["kTh"]
     kTo = params["kTo"] 
 
-    if orient == "NED":
-        mixerFM = np.array([[    kTh,      kTh,      kTh,      kTh],
-                            [dym*kTh, -dym*kTh,  -dym*kTh, dym*kTh],
-                            [dxm*kTh,  dxm*kTh, -dxm*kTh, -dxm*kTh],
-                            [   -kTo,      kTo,     -kTo,      kTo]])
-    else: # ENU
-        mixerFM = np.array([[     kTh,      kTh,      kTh,     kTh],
-                            [ dym*kTh, -dym*kTh, -dym*kTh, dym*kTh],
-                            [-dxm*kTh, -dxm*kTh,  dxm*kTh, dxm*kTh],
-                            [     kTo,     -kTo,      kTo,    -kTo]])
+    # Building mapping matrix based on:
+    # T = k * sum(w_i^2)
+    # tx = l * k * (w4^2 - w2^2)
+    # ty = l * k * (w3^2 - w1^2)
+    # tz = b * (w1^2 - w2^2 + w3^2 - w4^2)
+    
+    mixerFM = np.array([
+        [kTh,  kTh,  kTh,  kTh],      # Total Thrust
+        [0.0, -dym*kTh, 0.0, dym*kTh], # Roll (matches tx = k*dym*(w4^2 - w2^2))
+        [-dxm*kTh, 0.0, dxm*kTh, 0.0], # Pitch (matches ty = k*dxm*(w3^2 - w1^2))
+        [kTo, -kTo, kTo, -kTo]         # Yaw (matches tz = b*(w1^2 - w2^2 + w3^2 - w4^2))
+    ])
     return mixerFM

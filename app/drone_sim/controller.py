@@ -1,24 +1,24 @@
 import numpy as np
 from numpy import sin, cos, sqrt, pi
 from numpy.linalg import norm
-from .math_utils import vectNormalize, RotToQuat, quatMultiply, inverse, quat2Dcm, mixerFM
+from .math_utils import vect_normalize, get_rotation_matrix, mixerFM
 
 class Control:
     def __init__(self, quad, params, yawType, orient="NED"):
         self.params = params
         self.orient = orient
-        self.sDesCalc = np.zeros(16)
+        self.sDesCalc = np.zeros(12) # Reduced from 16, no quaternions
         self.w_cmd = np.ones(4) * quad.params["w_hover"]
         self.thr_int = np.zeros(3)
         
-        # Gains (can be made configurable)
-        self.pos_P_gain = np.array([1.0, 1.0, 1.0])
-        self.vel_P_gain = np.array([5.0, 5.0, 4.0])
-        self.vel_D_gain = np.array([0.5, 0.5, 0.5])
-        self.vel_I_gain = np.array([5.0, 5.0, 5.0])
-        self.att_P_gain = np.array([8.0, 8.0, 1.5])
-        self.rate_P_gain = np.array([1.5, 1.5, 1.0])
-        self.rate_D_gain = np.array([0.04, 0.04, 0.1])
+        # Gains (Reduced to prevent 'rippling' oscillations)
+        self.pos_P_gain = np.array([2.0, 2.0, 2.0])
+        self.vel_P_gain = np.array([10.0, 10.0, 8.0])
+        self.vel_D_gain = np.array([1.0, 1.0, 1.0])
+        self.vel_I_gain = np.array([2.0, 2.0, 2.0])
+        self.att_P_gain = np.array([10.0, 10.0, 2.0])
+        self.rate_P_gain = np.array([0.1, 0.1, 0.1])
+        self.rate_D_gain = np.array([0.02, 0.02, 0.05])
         
         if yawType == 0:
             self.att_P_gain[2] = 0
@@ -68,8 +68,7 @@ class Control:
         self.sDesCalc[0:3] = self.pos_sp
         self.sDesCalc[3:6] = self.vel_sp
         self.sDesCalc[6:9] = self.thrust_sp
-        self.sDesCalc[9:13] = self.qd
-        self.sDesCalc[13:16] = self.rate_sp
+        self.sDesCalc[9:12] = self.rate_sp
 
     def z_pos_control(self, quad, Ts):
         pos_z_error = self.pos_sp[2] - quad.pos[2]
@@ -117,37 +116,42 @@ class Control:
 
     def thrustToAttitude(self, quad, Ts):
         yaw_sp = self.eul_sp[2]
-        body_z = -vectNormalize(self.thrust_sp)
-        if self.orient == "ENU":
-            body_z = -body_z
-        y_C = np.array([-sin(yaw_sp), cos(yaw_sp), 0.0])
-        body_x = vectNormalize(np.cross(y_C, body_z))
+        # In our Euler-first model, we find the body-z vector needed to achieve thrust_sp
+        body_z = vect_normalize(self.thrust_sp)
+        if self.orient == "NED":
+            body_z = vect_normalize(-self.thrust_sp)
+        
+        # Calculate desired orientation (R_sp)
+        y_C = np.array([-np.sin(yaw_sp), np.cos(yaw_sp), 0.0])
+        body_x = vect_normalize(np.cross(y_C, body_z))
         body_y = np.cross(body_z, body_x)
-        R_sp = np.array([body_x, body_y, body_z]).T
-        self.qd_full = RotToQuat(R_sp)
+        
+        # Desired Euler angles (extracted from Rotation matrix)
+        # ZYX convention: R = Rz(psi)Ry(theta)Rx(phi)
+        # sin(theta) = -R[2,0]
+        self.theta_sp = np.arcsin(np.clip(-body_x[2], -1, 1))
+        self.phi_sp = np.arctan2(body_y[2], body_z[2])
+        self.psi_sp = yaw_sp
 
     def attitude_control(self, quad, Ts):
-        e_z = quad.dcm[:,2]
-        e_z_d = -vectNormalize(self.thrust_sp)
-        if self.orient == "ENU":
-            e_z_d = -e_z_d
-
-        qe_red = np.zeros(4)
-        qe_red[0] = np.dot(e_z, e_z_d) + sqrt(norm(e_z)**2 * norm(e_z_d)**2)
-        qe_red[1:4] = np.cross(e_z, e_z_d)
-        qe_red = vectNormalize(qe_red)
+        # Desired Rates p, q, r
+        e_phi = self.phi_sp - quad.state[3]
+        e_theta = self.theta_sp - quad.state[4]
+        e_psi = self.psi_sp - quad.state[5]
         
-        self.qd_red = quatMultiply(qe_red, quad.quat)
-        q_mix = quatMultiply(inverse(self.qd_red), self.qd_full)
-        q_mix = q_mix * np.sign(q_mix[0])
-        q_mix[0] = np.clip(q_mix[0], -1.0, 1.0)
-        q_mix[3] = np.clip(q_mix[3], -1.0, 1.0)
-        self.qd = quatMultiply(self.qd_red, np.array([cos(self.yaw_w*np.arccos(q_mix[0])), 0, 0, sin(self.yaw_w*np.arcsin(q_mix[3]))]))
-        self.qe = quatMultiply(inverse(quad.quat), self.qd)
-        self.rate_sp = (2.0*np.sign(self.qe[0])*self.qe[1:4]) * self.att_P_gain
-        self.rate_sp += quat2Dcm(inverse(quad.quat))[:,2] * self.yawFF
+        # KEY FIX: Angle wrapping for Yaw
+        # Prevents the drone from rotating the long way around (flickering/nutting out)
+        e_psi = (e_psi + np.pi) % (2 * np.pi) - np.pi
+        
+        # Simple P-control for orientation
+        self.rate_sp = np.array([
+            self.att_P_gain[0] * e_phi,
+            self.att_P_gain[1] * e_theta,
+            self.att_P_gain[2] * e_psi
+        ])
         self.rate_sp = np.clip(self.rate_sp, -self.rateMax, self.rateMax)
 
     def rate_control(self, quad, Ts):
+        # Rate control remains simple P; D term removed to reduce high-frequency ripple
         rate_error = self.rate_sp - quad.omega
-        self.rateCtrl = self.rate_P_gain * rate_error - self.rate_D_gain * quad.omega_dot
+        self.rateCtrl = self.rate_P_gain * rate_error
